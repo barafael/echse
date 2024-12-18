@@ -5,15 +5,20 @@ use defmt::{println, warn};
 use defmt_rtt as _;
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
+use fugit::MicrosDurationU32;
+
 use panic_probe as _;
 
-use crate::interrupt::IO_IRQ_BANK0;
-use embedded_hal::digital::StatefulOutputPin;
+use embedded_hal::digital::OutputPin;
+
 use rp2040_hal::{
     Timer,
     gpio::{self, Interrupt::EdgeLow},
     pac::{NVIC, Peripherals, interrupt},
+    timer::{Alarm, Alarm0},
 };
+
+use crate::interrupt::{IO_IRQ_BANK0, TIMER_IRQ_0};
 
 use core::cell::RefCell;
 use critical_section::Mutex;
@@ -31,10 +36,13 @@ type ButtonPin = gpio::Pin<gpio::bank0::Gpio16, gpio::FunctionSioInput, gpio::Pu
 static GLOBAL_LED: Mutex<RefCell<Option<LedPin>>> = Mutex::new(RefCell::new(None));
 static GLOBAL_BUTTON: Mutex<RefCell<Option<ButtonPin>>> = Mutex::new(RefCell::new(None));
 
+static GLOBAL_ALARM: Mutex<RefCell<Option<Alarm0>>> = Mutex::new(RefCell::new(None));
+
 static CHANNEL: Channel<CriticalSectionRawMutex, Event, 10> = Channel::new();
 
 enum Event {
     ButtonPressed,
+    AlarmExpired,
 }
 
 #[rp2040_hal::entry]
@@ -54,7 +62,12 @@ fn main() -> ! {
         &mut watchdog,
     )
     .unwrap();
-    let _timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+    let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+
+    let alarm = timer.alarm_0().unwrap();
+    critical_section::with(|cs| {
+        GLOBAL_ALARM.borrow(cs).replace(Some(alarm));
+    });
 
     let sio = rp2040_hal::Sio::new(pac.SIO);
 
@@ -80,7 +93,10 @@ fn main() -> ! {
 
     unsafe {
         NVIC::unmask(IO_IRQ_BANK0);
+        NVIC::unmask(TIMER_IRQ_0);
     }
+
+    let mut counter = 0;
 
     loop {
         println!("going to sleep");
@@ -92,11 +108,17 @@ fn main() -> ! {
         };
         match event {
             Event::ButtonPressed => {
-                println!("Button pressed");
+                println!("Button pressed, scheduling alarm");
                 critical_section::with(|cs| {
-                    toggle_led(cs);
+                    schedule_alarm(cs);
+                    led_on(cs);
                 });
                 println!("New alarm scheduled");
+            }
+            Event::AlarmExpired => {
+                critical_section::with(led_off);
+                counter += 1;
+                println!("Alarm expired {}", counter);
             }
         };
     }
@@ -124,12 +146,43 @@ fn IO_IRQ_BANK0() {
     println!("end gpio interrupt");
 }
 
-fn toggle_led(cs: critical_section::CriticalSection) {
+#[interrupt]
+fn TIMER_IRQ_0() {
+    println!("timer interrupt");
+
+    critical_section::with(|cs| {
+        let mut guard = GLOBAL_ALARM.borrow(cs).borrow_mut();
+        guard.as_mut().unwrap().clear_interrupt();
+    });
+    if let Err(_e) = CHANNEL.try_send(Event::AlarmExpired) {
+        warn!("Channel full, skipping event");
+    }
+    println!("end timer interrupt");
+}
+
+fn schedule_alarm(cs: critical_section::CriticalSection<'_>) {
+    const DURATION: MicrosDurationU32 = MicrosDurationU32::secs(1);
+    let mut alarm = GLOBAL_ALARM.borrow(cs).borrow_mut();
+    alarm.as_mut().unwrap().schedule(DURATION).unwrap();
+    alarm.as_mut().unwrap().enable_interrupt();
+}
+
+fn led_on(cs: critical_section::CriticalSection) {
     GLOBAL_LED
         .borrow(cs)
         .borrow_mut()
         .as_mut()
         .unwrap()
-        .toggle()
+        .set_high()
+        .unwrap();
+}
+
+fn led_off(cs: critical_section::CriticalSection<'_>) {
+    GLOBAL_LED
+        .borrow(cs)
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .set_low()
         .unwrap();
 }
