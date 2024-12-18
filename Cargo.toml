@@ -1,0 +1,21 @@
+[package]
+name = "echse"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rp2040-hal = { version = "0.10.2", features = ["rt", "critical-section-impl"] }
+cortex-m = "0.7.2"
+cortex-m-rt = "0.7"
+critical-section = { version = "1.2.0" }
+defmt = "0.3"
+defmt-rtt = "0.4.0"
+embassy-sync = "0.6.1"
+fugit = "0.3.6"
+panic-probe = { version = "0.3.1", features = ["print-defmt"] }
+pio = "0.2.0"
+pio-proc = "0.2.0"
+portable-atomic = { version = "1.7.0", features = ["critical-section"] }
+rp2040-boot2 = "0.3.0"
+
+embedded-hal = "1"
