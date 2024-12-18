@@ -6,9 +6,16 @@ use defmt_rtt as _;
 
 use panic_probe as _;
 
-use embedded_hal::{delay::DelayNs, digital::OutputPin};
+use embedded_hal::{
+    delay::DelayNs,
+    digital::{InputPin, OutputPin},
+};
 
-use rp2040_hal::{Timer, pac::Peripherals};
+use rp2040_hal::{
+    Timer,
+    gpio::{self, Interrupt::EdgeLow},
+    pac::Peripherals,
+};
 
 #[unsafe(link_section = ".boot2")]
 #[used]
@@ -33,7 +40,7 @@ fn main() -> ! {
         &mut watchdog,
     )
     .unwrap();
-    let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+    let _timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
 
     let sio = rp2040_hal::Sio::new(pac.SIO);
 
@@ -46,11 +53,17 @@ fn main() -> ! {
 
     let mut led = pins.gpio25.into_push_pull_output();
 
+    let mut in_pin = pins.gpio16.into_pull_up_input();
+    in_pin.set_slew_rate(gpio::OutputSlewRate::Slow);
+    in_pin.set_schmitt_enabled(true);
+
+    in_pin.set_interrupt_enabled(EdgeLow, true);
+
     loop {
-        println!("loop");
-        led.set_high().unwrap();
-        timer.delay_ms(500);
-        led.set_low().unwrap();
-        timer.delay_ms(500);
+        if in_pin.is_low().unwrap() {
+            led.set_high().unwrap();
+        } else {
+            led.set_low().unwrap();
+        }
     }
 }
