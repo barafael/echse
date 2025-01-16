@@ -1,188 +1,169 @@
 #![no_std]
 #![no_main]
 
+use rtic_monotonics::rp2040::prelude::*;
+
 use defmt::{println, warn};
 use defmt_rtt as _;
 
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
-use fugit::MicrosDurationU32;
-
 use panic_probe as _;
 
-use embedded_hal::digital::OutputPin;
+rp2040_timer_monotonic!(Mono);
 
-use rp2040_hal::{
-    Timer,
-    gpio::{self, Interrupt::EdgeLow},
-    pac::{NVIC, Peripherals, interrupt},
-    timer::{Alarm, Alarm0},
-};
-
-use crate::interrupt::{IO_IRQ_BANK0, TIMER_IRQ_0};
-
-use core::cell::RefCell;
-use critical_section::Mutex;
-
-#[unsafe(link_section = ".boot2")]
-#[used]
-pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_GENERIC_03H;
-
-const XTAL_FREQ_HZ: u32 = 12_000_000u32;
-
-type LedPin = gpio::Pin<gpio::bank0::Gpio25, gpio::FunctionSioOutput, gpio::PullNone>;
-
-type ButtonPin = gpio::Pin<gpio::bank0::Gpio16, gpio::FunctionSioInput, gpio::PullUp>;
-
-static GLOBAL_LED: Mutex<RefCell<Option<LedPin>>> = Mutex::new(RefCell::new(None));
-static GLOBAL_BUTTON: Mutex<RefCell<Option<ButtonPin>>> = Mutex::new(RefCell::new(None));
-
-static GLOBAL_ALARM: Mutex<RefCell<Option<Alarm0>>> = Mutex::new(RefCell::new(None));
-
-static CHANNEL: Channel<CriticalSectionRawMutex, Event, 10> = Channel::new();
-
-enum Event {
+#[derive(Debug, defmt::Format)]
+pub enum Event {
     ButtonPressed,
     AlarmExpired,
 }
 
-#[rp2040_hal::entry]
-fn main() -> ! {
-    println!("hi!");
-    let mut pac = Peripherals::take().unwrap();
+#[rtic::app(device = rp_pico::hal::pac)]
+mod app {
+    use super::*;
 
-    let mut watchdog = rp2040_hal::Watchdog::new(pac.WATCHDOG);
+    use fugit::MicrosDurationU32;
+    use heapless::mpmc::Q16;
+    use rp_pico::hal::gpio::bank0::Gpio16;
+    use rp_pico::hal::gpio::{Pin, PullDown};
+    use rp_pico::hal::timer::{Alarm, Alarm1};
+    use rp_pico::hal::{self, Timer, Watchdog, clocks};
+    use rp_pico::hal::{
+        gpio::{self, FunctionSio, PullNone, SioOutput, bank0::Gpio25},
+        sio::Sio,
+    };
+    use rp_pico::pac::NVIC;
 
-    let clocks = rp2040_hal::clocks::init_clocks_and_plls(
-        XTAL_FREQ_HZ,
-        pac.XOSC,
-        pac.CLOCKS,
-        pac.PLL_SYS,
-        pac.PLL_USB,
-        &mut pac.RESETS,
-        &mut watchdog,
-    )
-    .unwrap();
-    let mut timer = Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
+    use embedded_hal::digital::v2::OutputPin;
+    use panic_probe as _;
+    use rp_pico::XOSC_CRYSTAL_FREQ;
 
-    let alarm = timer.alarm_0().unwrap();
-    critical_section::with(|cs| {
-        GLOBAL_ALARM.borrow(cs).replace(Some(alarm));
-    });
+    type LedPin = Pin<Gpio25, FunctionSio<SioOutput>, PullNone>;
+    type ButtonPin = Pin<Gpio16, gpio::FunctionSioInput, PullDown>;
 
-    let sio = rp2040_hal::Sio::new(pac.SIO);
-
-    let pins = rp2040_hal::gpio::Pins::new(
-        pac.IO_BANK0,
-        pac.PADS_BANK0,
-        sio.gpio_bank0,
-        &mut pac.RESETS,
-    );
-
-    let led = pins.gpio25.reconfigure();
-
-    let mut in_pin = pins.gpio16.into_pull_up_input();
-    in_pin.set_slew_rate(gpio::OutputSlewRate::Slow);
-    in_pin.set_schmitt_enabled(true);
-
-    in_pin.set_interrupt_enabled(EdgeLow, true);
-
-    critical_section::with(|cs| {
-        GLOBAL_LED.borrow(cs).replace(Some(led));
-        GLOBAL_BUTTON.borrow(cs).replace(Some(in_pin));
-    });
-
-    unsafe {
-        NVIC::unmask(IO_IRQ_BANK0);
-        NVIC::unmask(TIMER_IRQ_0);
+    #[shared]
+    struct Shared {
+        queue: heapless::mpmc::Q16<Event>,
+        alarm: Alarm1,
     }
 
-    let mut counter = 0;
-
-    loop {
-        println!("going to sleep");
-        cortex_m::asm::wfi();
-        println!("woke up");
-
-        let Ok(event) = CHANNEL.try_receive() else {
-            continue;
-        };
-        match event {
-            Event::ButtonPressed => {
-                println!("Button pressed, scheduling alarm");
-                critical_section::with(|cs| {
-                    schedule_alarm(cs);
-                    led_on(cs);
-                });
-                println!("New alarm scheduled");
-            }
-            Event::AlarmExpired => {
-                critical_section::with(led_off);
-                counter += 1;
-                println!("Alarm expired {}", counter);
-            }
-        };
+    #[local]
+    struct Local {
+        led: LedPin,
+        button: ButtonPin,
+        counter: u32,
     }
-}
 
-#[interrupt]
-fn IO_IRQ_BANK0() {
-    println!("gpio interrupt");
-
-    let edge = critical_section::with(|cs| {
-        let mut guard = GLOBAL_BUTTON.borrow(cs).borrow_mut();
-        let button = guard.as_mut().unwrap();
-        if button.interrupt_status(EdgeLow) {
-            button.clear_interrupt(EdgeLow);
-            true
-        } else {
-            false
-        }
-    });
-    if edge {
-        if let Err(_e) = CHANNEL.try_send(Event::ButtonPressed) {
-            warn!("Channel full, skipping event");
-        }
-    }
-    println!("end gpio interrupt");
-}
-
-#[interrupt]
-fn TIMER_IRQ_0() {
-    println!("timer interrupt");
-
-    critical_section::with(|cs| {
-        let mut guard = GLOBAL_ALARM.borrow(cs).borrow_mut();
-        guard.as_mut().unwrap().clear_interrupt();
-    });
-    if let Err(_e) = CHANNEL.try_send(Event::AlarmExpired) {
-        warn!("Channel full, skipping event");
-    }
-    println!("end timer interrupt");
-}
-
-fn schedule_alarm(cs: critical_section::CriticalSection<'_>) {
-    const DURATION: MicrosDurationU32 = MicrosDurationU32::secs(1);
-    let mut alarm = GLOBAL_ALARM.borrow(cs).borrow_mut();
-    alarm.as_mut().unwrap().schedule(DURATION).unwrap();
-    alarm.as_mut().unwrap().enable_interrupt();
-}
-
-fn led_on(cs: critical_section::CriticalSection) {
-    GLOBAL_LED
-        .borrow(cs)
-        .borrow_mut()
-        .as_mut()
-        .unwrap()
-        .set_high()
+    #[init]
+    fn init(mut ctx: init::Context) -> (Shared, Local) {
+        let mut watchdog = Watchdog::new(ctx.device.WATCHDOG);
+        let clocks = clocks::init_clocks_and_plls(
+            XOSC_CRYSTAL_FREQ,
+            ctx.device.XOSC,
+            ctx.device.CLOCKS,
+            ctx.device.PLL_SYS,
+            ctx.device.PLL_USB,
+            &mut ctx.device.RESETS,
+            &mut watchdog,
+        )
+        .ok()
         .unwrap();
-}
 
-fn led_off(cs: critical_section::CriticalSection<'_>) {
-    GLOBAL_LED
-        .borrow(cs)
-        .borrow_mut()
-        .as_mut()
-        .unwrap()
-        .set_low()
-        .unwrap();
+        // Init LED pin
+        let sio = Sio::new(ctx.device.SIO);
+        let pins = rp_pico::Pins::new(
+            ctx.device.IO_BANK0,
+            ctx.device.PADS_BANK0,
+            sio.gpio_bank0,
+            &mut ctx.device.RESETS,
+        );
+        let mut led = pins
+            .led
+            .into_pull_type::<PullNone>()
+            .into_push_pull_output();
+        led.set_low().unwrap();
+
+        let button = pins.gpio16.into_pull_down_input();
+        button.set_interrupt_enabled(gpio::Interrupt::EdgeHigh, true);
+
+        let mut timer = Timer::new(ctx.device.TIMER, &mut ctx.device.RESETS, &clocks);
+
+        let mut alarm = timer.alarm_1().unwrap();
+        alarm.enable_interrupt();
+
+        unsafe {
+            NVIC::unmask(hal::pac::Interrupt::IO_IRQ_BANK0);
+            NVIC::unmask(hal::pac::Interrupt::TIMER_IRQ_1);
+        }
+
+        ctx.core.SCB.set_sleepdeep();
+
+        (
+            Shared {
+                queue: Q16::new(),
+                alarm,
+            },
+            Local {
+                led,
+                button,
+                counter: 0,
+            },
+        )
+    }
+
+    #[idle(shared = [queue, alarm], local = [led, counter])]
+    fn idle(mut ctx: idle::Context) -> ! {
+        const DURATION: MicrosDurationU32 = MicrosDurationU32::secs(1);
+        let mut on = false;
+
+        loop {
+            println!("going to sleep");
+            cortex_m::asm::wfi();
+            println!("woke up");
+
+            let Some(event) = ctx.shared.queue.lock(|q| q.dequeue()) else {
+                continue;
+            };
+
+            match event {
+                Event::ButtonPressed => {
+                    println!("Button pressed");
+                    ctx.shared
+                        .alarm
+                        .lock(|alarm| alarm.schedule(DURATION))
+                        .unwrap();
+                    if !on {
+                        ctx.local.led.set_high().unwrap();
+                        on = true;
+                    }
+                }
+                Event::AlarmExpired => {
+                    *ctx.local.counter += 1;
+                    println!("Alarm expired {}", ctx.local.counter);
+                    ctx.local.led.set_low().unwrap();
+                    on = false;
+                }
+            };
+        }
+    }
+
+    #[task(shared = [queue], local = [button], binds = IO_IRQ_BANK0)]
+    fn on_gpio(mut ctx: on_gpio::Context) {
+        defmt::println!("button irq");
+        if let Err(e) = ctx.shared.queue.lock(|q| q.enqueue(Event::ButtonPressed)) {
+            warn!("skipped button press: {}", e);
+        }
+        ctx.local.button.clear_interrupt(gpio::Interrupt::EdgeHigh);
+    }
+
+    #[task(shared = [queue, alarm], binds = TIMER_IRQ_1)]
+    fn on_timer_expiration(mut ctx: on_timer_expiration::Context) {
+        println!("timer interrupt");
+        if let Err(e) = ctx
+            .shared
+            .queue
+            .lock(|queue| queue.enqueue(Event::AlarmExpired))
+        {
+            warn!("skipped alarm expiration: {}", e);
+        }
+        ctx.shared.alarm.lock(|alarm| alarm.clear_interrupt());
+    }
 }
